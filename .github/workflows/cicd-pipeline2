@@ -1,0 +1,103 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy-to-cml:
+    runs-on: ubuntu-latest
+    env:
+      # Repo Variables (Settings > Secrets and variables > Actions > Variables)
+      CDSW_DOMAIN: ${{ vars.CDSW_DOMAIN }}
+      PROJ_NAME: ${{ vars.PROJ_NAME }}
+      RUN_TIME: ${{ vars.RUN_TIME }}
+      RUN_TIME_ADDON: ${{ vars.RUN_TIME_ADDON }}  # optional (only if you use it)
+      # Repo Secret
+      API_KEY: ${{ secrets.CML_API_KEY }}
+
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Get Project ID
+        run: |
+          set -euo pipefail
+
+          PROJECT_ID=$(
+            curl -sS -X GET \
+              "$CDSW_DOMAIN/api/v2/projects?search_filter=%7B%22name%22%3A%22$PROJ_NAME%22%7D" \
+              -H "accept: application/json" \
+              -H "Authorization: Bearer $API_KEY" \
+            | jq -r ".projects|.[0]|.id"
+          )
+
+          if [[ -z "${PROJECT_ID:-}" || "$PROJECT_ID" == "null" ]]; then
+            echo "ERROR: Could not find project id for PROJ_NAME=$PROJ_NAME"
+            exit 1
+          fi
+
+          echo "Project ID: $PROJECT_ID"
+          echo "PROJECT_ID=$PROJECT_ID" >> "$GITHUB_ENV"
+
+      - name: Create Bootstrap Job and Run
+        env:
+          PROJECT_ID: ${{ env.PROJECT_ID }}
+        run: |
+          set -euo pipefail
+
+          JOB_ID=$(
+            curl -sS -X POST "$CDSW_DOMAIN/api/v2/projects/$PROJECT_ID/jobs" \
+              -H "accept: application/json" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{ \"cpu\": 2, \"memory\": 4, \"name\": \"bootstrap\", \"runtime_identifier\": \"$RUN_TIME\", \"script\": \"0_bootstrap.py\"}" \
+            | jq -r ".id"
+          )
+
+          if [[ -z "${JOB_ID:-}" || "$JOB_ID" == "null" ]]; then
+            echo "ERROR: Failed to create bootstrap job"
+            exit 1
+          fi
+
+          echo "Job ID: $JOB_ID"
+          echo "JOB_ID=$JOB_ID" >> "$GITHUB_ENV"
+
+          curl -sS -X POST "$CDSW_DOMAIN/api/v2/projects/$PROJECT_ID/jobs/$JOB_ID/runs" \
+            -H "accept: application/json" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            > /dev/null
+
+      - name: Wait for 30 Seconds
+        run: sleep 30
+
+      - name: Create and Execute Fit Model Job
+        env:
+          PROJECT_ID: ${{ env.PROJECT_ID }}
+        run: |
+          set -euo pipefail
+
+          EXPERIMENT_JOB_ID=$(
+            curl -sS -X POST "$CDSW_DOMAIN/api/v2/projects/$PROJECT_ID/jobs" \
+              -H "accept: application/json" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{ \"cpu\": 2, \"memory\": 4, \"name\": \"train_experiment\", \"runtime_identifier\": \"$RUN_TIME\", \"script\": \"fit.py\"}" \
+            | jq -r ".id"
+          )
+
+          if [[ -z "${EXPERIMENT_JOB_ID:-}" || "$EXPERIMENT_JOB_ID" == "null" ]]; then
+            echo "ERROR: Failed to create experiment job"
+            exit 1
+          fi
+
+          echo "Experiment Job ID: $EXPERIMENT_JOB_ID"
+
+          curl -sS -X POST "$CDSW_DOMAIN/api/v2/projects/$PROJECT_ID/jobs/$EXPERIMENT_JOB_ID/runs" \
+            -H "accept: application/json" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            > /dev/null
